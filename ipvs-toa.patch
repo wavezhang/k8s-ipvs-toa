@@ -1,0 +1,442 @@
+diff --git a/include/net/ip_vs.h b/include/net/ip_vs.h
+index 5d08c19..27df4d8 100644
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -348,6 +348,22 @@ enum ip_vs_sctp_states {
+        IP_VS_SCTP_S_LAST
+ };
+ 
++#define TCPOPT_ADDR  254
++#define TCPOLEN_ADDR 8         /* |opcode|size|ip+port| = 1 + 1 + 6 */
++
++/*
++ * insert client ip in tcp option, now only support IPV4,
++ * must be 4 bytes alignment.
++ */
++struct ip_vs_tcpo_addr {
++       __u8 opcode;
++       __u8 opsize;
++       __u16 port;
++       __u32 addr;
++};
++
++extern int sysctl_ip_vs_toa_entry;
++
+ /* Delta sequence info structure
+  * Each ip_vs_conn has 2 (output AND input seq. changes).
+  * Only used in the VS/NAT.
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index e8f1556..3a5bbdd 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -66,6 +66,8 @@ int ip_vs_get_debug_level(void)
+ }
+ #endif
+ 
++int sysctl_ip_vs_toa_entry = 1;
++
+ 
+ /*  Protos */
+ static void __ip_vs_del_service(struct ip_vs_service *svc, bool cleanup);
+@@ -1637,6 +1639,7 @@ static int ip_vs_zero_all(struct netns_ipvs *ipvs)
+ #ifdef CONFIG_SYSCTL
+ 
+ static int zero;
++static int one = 1;
+ static int three = 3;
+ 
+ static int
+@@ -1884,6 +1887,15 @@ static int ip_vs_zero_all(struct netns_ipvs *ipvs)
+                .mode           = 0644,
+                .proc_handler   = proc_dointvec,
+        },
++       {
++               .procname = "nat_toa_entry",
++               .data = &sysctl_ip_vs_toa_entry,
++               .maxlen = sizeof(int),
++               .mode = 0644,
++               .proc_handler   = proc_dointvec_minmax,
++               .extra1         = &zero,
++               .extra2         = &one,
++        },
+ #ifdef CONFIG_IP_VS_DEBUG
+        {
+                .procname       = "debug_level",
+diff --git a/net/netfilter/ipvs/ip_vs_proto_tcp.c b/net/netfilter/ipvs/ip_vs_proto_tcp.c
+index 121a321..cfa842c 100644
+--- a/net/netfilter/ipvs/ip_vs_proto_tcp.c
++++ b/net/netfilter/ipvs/ip_vs_proto_tcp.c
+@@ -142,6 +142,110 @@
+                                                csum_unfold(tcph->check))));
+ }
+ 
++/*
++ * add client (ip and port) in tcp option
++ * return 0 if success
++ */
++static int tcp_opt_add_toa(struct ip_vs_conn *cp,
++                                      struct sk_buff *skb,
++                                      struct tcphdr **tcph)
++{
++       __u32 mtu;
++       struct ip_vs_tcpo_addr *toa;
++       unsigned int tcphoff;
++       struct tcphdr *th;
++       __u8 *p, *q;
++
++       /* now only process IPV4 */
++       if (cp->af != AF_INET) {
++               return 1;
++       }
++
++       /* skb length and tcp option length checking */
++       if (skb_dst(skb))
++               mtu = dst_mtu(skb_dst(skb));
++       else             /* fast_xmit can reach here */
++               mtu = sizeof(struct ip_vs_tcpo_addr);
++
++       if (skb->len > (mtu - sizeof(struct ip_vs_tcpo_addr))) {
++               return 1;
++       }
++
++       /* the maximum length of TCP head is 60 bytes, so only 40 bytes for options */
++       if ((60 - ((*tcph)->doff << 2)) < sizeof(struct ip_vs_tcpo_addr)) {
++               return 1;
++       }
++
++       /* expand skb if needed */
++       if ((sizeof(struct ip_vs_tcpo_addr) > skb_tailroom(skb)) &&
++                       pskb_expand_head(skb, 0,
++                       sizeof(struct ip_vs_tcpo_addr), GFP_ATOMIC)){
++               return 1;
++       }
++
++       /*
++        * add client ip
++        */
++       tcphoff = ip_hdrlen(skb);
++       /* get new tcp header */
++       *tcph = th =
++           (struct tcphdr *)((void *)skb_network_header(skb) + tcphoff);
++
++       /* ptr to old opts */
++       p = skb_tail_pointer(skb) - 1;
++       q = p + sizeof(struct ip_vs_tcpo_addr);
++
++       /* move data down, offset is sizeof(struct ip_vs_tcpo_addr) */
++       while (p >= ((__u8 *) th + sizeof(struct tcphdr))) {
++               *q = *p;
++               p--;
++               q--;
++       }
++
++       /* move tail to new postion */
++       skb->tail += sizeof(struct ip_vs_tcpo_addr);
++
++       /* put client ip opt , ptr point to opts */
++       toa = (struct ip_vs_tcpo_addr *)(th + 1);
++       toa->opcode = TCPOPT_ADDR;
++       toa->opsize = TCPOLEN_ADDR;
++       toa->port = cp->cport;
++       toa->addr = cp->caddr.ip;
++
++       /* reset tcp header length */
++       th->doff += sizeof(struct ip_vs_tcpo_addr) / 4;
++       /* reset ip header totoal length */
++       ip_hdr(skb)->tot_len =
++           htons(ntohs(ip_hdr(skb)->tot_len) +
++                 sizeof(struct ip_vs_tcpo_addr));
++       /* reset skb length */
++       skb->len += sizeof(struct ip_vs_tcpo_addr);
++
++       /* re-calculate tcp csum, if no csum_offload */
++        bool sysctl_ip_vs_csum_offload = false;
++       if (!sysctl_ip_vs_csum_offload) {
++               th->check = 0;
++               skb->csum = skb_checksum(skb, tcphoff,
++                                       skb->len - tcphoff, 0);
++               th->check = csum_tcpudp_magic(cp->caddr.ip,
++                                       cp->vaddr.ip,
++                                       skb->len - tcphoff,
++                                       cp->protocol, skb->csum);
++
++               if (skb->ip_summed == CHECKSUM_PARTIAL) {
++                       skb->ip_summed = CHECKSUM_COMPLETE;
++                       skb_shinfo(skb)->gso_size = 0;
++               }
++       }
++
++       /* re-calculate ip head csum, tot_len has been adjusted */
++       ip_send_check(ip_hdr(skb));
++
++       return 0;
++}
++
++
++
+ 
+ static int
+ tcp_snat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
+@@ -225,6 +329,7 @@
+ tcp_dnat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
+                 struct ip_vs_conn *cp, struct ip_vs_iphdr *iph)
+ {
++
+        struct tcphdr *tcph;
+        unsigned int tcphoff = iph->len;
+        int oldlen;
+@@ -261,6 +366,24 @@
+        }
+ 
+        tcph = (void *)skb_network_header(skb) + tcphoff;
++
++
++       /*
++        * for syn packet
++        * add toa
++        */
++       if (tcph->syn & !tcph->ack) {
++               tcp_opt_add_toa(cp, skb, &tcph);
++       }
++
++       /* TOA: add client ip */
++       if ((sysctl_ip_vs_toa_entry == 1)
++           // && (ntohl(tcph->ack_seq) == cp->in_seq.init_seq)
++           && !tcph->syn && !tcph->rst && !tcph->fin) {
++                       tcp_opt_add_toa(cp, skb, &tcph);
++       }
++
++
+        tcph->dest = cp->dport;
+ 
+        /*
+@@ -299,7 +422,6 @@
+        return 1;
+ }
+ 
+-
+ static int
+ tcp_csum_check(int af, struct sk_buff *skb, struct ip_vs_protocol *pp)
+ {
+[root@compute076 linux-4.14.49]# git diff > ipvs_toa.patch
+[root@compute076 linux-4.14.49]# cat ipvs_toa.patch 
+diff --git a/include/net/ip_vs.h b/include/net/ip_vs.h
+index 5d08c19..27df4d8 100644
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -348,6 +348,22 @@ enum ip_vs_sctp_states {
+ 	IP_VS_SCTP_S_LAST
+ };
+ 
++#define TCPOPT_ADDR  254
++#define TCPOLEN_ADDR 8		/* |opcode|size|ip+port| = 1 + 1 + 6 */
++
++/*
++ * insert client ip in tcp option, now only support IPV4,
++ * must be 4 bytes alignment.
++ */
++struct ip_vs_tcpo_addr {
++	__u8 opcode;
++	__u8 opsize;
++	__u16 port;
++	__u32 addr;
++};
++
++extern int sysctl_ip_vs_toa_entry;
++
+ /* Delta sequence info structure
+  * Each ip_vs_conn has 2 (output AND input seq. changes).
+  * Only used in the VS/NAT.
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index e8f1556..3a5bbdd 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -66,6 +66,8 @@ int ip_vs_get_debug_level(void)
+ }
+ #endif
+ 
++int sysctl_ip_vs_toa_entry = 1;
++
+ 
+ /*  Protos */
+ static void __ip_vs_del_service(struct ip_vs_service *svc, bool cleanup);
+@@ -1637,6 +1639,7 @@ static int ip_vs_zero_all(struct netns_ipvs *ipvs)
+ #ifdef CONFIG_SYSCTL
+ 
+ static int zero;
++static int one = 1;
+ static int three = 3;
+ 
+ static int
+@@ -1884,6 +1887,15 @@ static int ip_vs_zero_all(struct netns_ipvs *ipvs)
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 	},
++	{
++	 	.procname = "nat_toa_entry",
++	 	.data = &sysctl_ip_vs_toa_entry,
++	 	.maxlen = sizeof(int),
++	 	.mode = 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &one,
++	 },
+ #ifdef CONFIG_IP_VS_DEBUG
+ 	{
+ 		.procname	= "debug_level",
+diff --git a/net/netfilter/ipvs/ip_vs_proto_tcp.c b/net/netfilter/ipvs/ip_vs_proto_tcp.c
+index 121a321..cfa842c 100644
+--- a/net/netfilter/ipvs/ip_vs_proto_tcp.c
++++ b/net/netfilter/ipvs/ip_vs_proto_tcp.c
+@@ -142,6 +142,110 @@
+ 						csum_unfold(tcph->check))));
+ }
+ 
++/*
++ * add client (ip and port) in tcp option
++ * return 0 if success
++ */
++static int tcp_opt_add_toa(struct ip_vs_conn *cp,
++				       struct sk_buff *skb,
++				       struct tcphdr **tcph)
++{
++	__u32 mtu;
++	struct ip_vs_tcpo_addr *toa;
++	unsigned int tcphoff;
++	struct tcphdr *th;
++	__u8 *p, *q;
++
++	/* now only process IPV4 */
++	if (cp->af != AF_INET) {
++		return 1;
++	}
++
++	/* skb length and tcp option length checking */
++	if (skb_dst(skb))
++		mtu = dst_mtu(skb_dst(skb));
++	else		 /* fast_xmit can reach here */
++		mtu = sizeof(struct ip_vs_tcpo_addr);
++
++	if (skb->len > (mtu - sizeof(struct ip_vs_tcpo_addr))) {
++		return 1;
++	}
++
++	/* the maximum length of TCP head is 60 bytes, so only 40 bytes for options */
++	if ((60 - ((*tcph)->doff << 2)) < sizeof(struct ip_vs_tcpo_addr)) {
++		return 1;
++	}
++
++	/* expand skb if needed */
++	if ((sizeof(struct ip_vs_tcpo_addr) > skb_tailroom(skb)) &&
++			pskb_expand_head(skb, 0,
++			sizeof(struct ip_vs_tcpo_addr), GFP_ATOMIC)){
++		return 1;
++	}
++
++	/*
++	 * add client ip
++	 */
++	tcphoff = ip_hdrlen(skb);
++	/* get new tcp header */
++	*tcph = th =
++	    (struct tcphdr *)((void *)skb_network_header(skb) + tcphoff);
++
++	/* ptr to old opts */
++	p = skb_tail_pointer(skb) - 1;
++	q = p + sizeof(struct ip_vs_tcpo_addr);
++
++	/* move data down, offset is sizeof(struct ip_vs_tcpo_addr) */
++	while (p >= ((__u8 *) th + sizeof(struct tcphdr))) {
++		*q = *p;
++		p--;
++		q--;
++	}
++
++	/* move tail to new postion */
++	skb->tail += sizeof(struct ip_vs_tcpo_addr);
++
++	/* put client ip opt , ptr point to opts */
++	toa = (struct ip_vs_tcpo_addr *)(th + 1);
++	toa->opcode = TCPOPT_ADDR;
++	toa->opsize = TCPOLEN_ADDR;
++	toa->port = cp->cport;
++	toa->addr = cp->caddr.ip;
++
++	/* reset tcp header length */
++	th->doff += sizeof(struct ip_vs_tcpo_addr) / 4;
++	/* reset ip header totoal length */
++	ip_hdr(skb)->tot_len =
++	    htons(ntohs(ip_hdr(skb)->tot_len) +
++		  sizeof(struct ip_vs_tcpo_addr));
++	/* reset skb length */
++	skb->len += sizeof(struct ip_vs_tcpo_addr);
++
++	/* re-calculate tcp csum, if no csum_offload */
++        bool sysctl_ip_vs_csum_offload = false;
++	if (!sysctl_ip_vs_csum_offload) {
++		th->check = 0;
++		skb->csum = skb_checksum(skb, tcphoff,
++					skb->len - tcphoff, 0);
++		th->check = csum_tcpudp_magic(cp->caddr.ip,
++					cp->vaddr.ip,
++					skb->len - tcphoff,
++					cp->protocol, skb->csum);
++
++		if (skb->ip_summed == CHECKSUM_PARTIAL) {
++			skb->ip_summed = CHECKSUM_COMPLETE;
++			skb_shinfo(skb)->gso_size = 0;
++		}
++	}
++
++	/* re-calculate ip head csum, tot_len has been adjusted */
++	ip_send_check(ip_hdr(skb));
++
++	return 0;
++}
++
++
++
+ 
+ static int
+ tcp_snat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
+@@ -225,6 +329,7 @@
+ tcp_dnat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
+ 		 struct ip_vs_conn *cp, struct ip_vs_iphdr *iph)
+ {
++
+ 	struct tcphdr *tcph;
+ 	unsigned int tcphoff = iph->len;
+ 	int oldlen;
+@@ -261,6 +366,24 @@
+ 	}
+ 
+ 	tcph = (void *)skb_network_header(skb) + tcphoff;
++
++
++	/*
++	 * for syn packet
++	 * add toa
++	 */
++	if (tcph->syn & !tcph->ack) {
++		tcp_opt_add_toa(cp, skb, &tcph);
++	}
++
++	/* TOA: add client ip */
++	if ((sysctl_ip_vs_toa_entry == 1)
++	    // && (ntohl(tcph->ack_seq) == cp->in_seq.init_seq)
++	    && !tcph->syn && !tcph->rst && !tcph->fin) {
++			tcp_opt_add_toa(cp, skb, &tcph);
++	}
++
++
+ 	tcph->dest = cp->dport;
+ 
+ 	/*
+@@ -299,7 +422,6 @@
+ 	return 1;
+ }
+ 
+-
+ static int
+ tcp_csum_check(int af, struct sk_buff *skb, struct ip_vs_protocol *pp)
+ {
