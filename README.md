@@ -1,7 +1,7 @@
 # k8s-ipvs-toa
 Let you get real client IP in k8s pod using [toa](https://github.com/Huawei/TCP_option_address). Only works if your kubeproxy  is using ipvs mode.
 
-Test on kernel 4.14 only, should work on 3.10+.
+Test on kernel 4.14 only, should work on 4.x, and should work on linux 3.10 with minor modification.
 
 ## How to use
 
